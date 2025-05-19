@@ -1,0 +1,175 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pydicom
+import matplotlib.pyplot as plt
+from skimage.restoration import denoise_tv_chambolle
+from scipy.ndimage import gaussian_filter
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+
+# Configuration
+noisy_dir = '/content/drive/MyDrive/SinoCT_noisy'
+clean_dir = '/content/drive/MyDrive/SinoCT'
+model_save_path = '/content/drive/MyDrive/SinoCT/hybrid_model.pth'
+batch_size = 4
+n_epochs = 50
+lr = 1e-4
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Traditional preprocessing function
+def traditional_pipeline(image):
+    norm_img = (image + 1000) / 4000
+    norm_img = np.clip(norm_img, 0, 1)
+
+    hamming_filtered = np.hamming(image.shape[0])[:, None] * np.hamming(image.shape[1])[None, :]
+    norm_img *= hamming_filtered
+
+    tv_denoised = denoise_tv_chambolle(norm_img, weight=0.1, channel_axis=None)
+    smoothed = gaussian_filter(tv_denoised, sigma=0.5)
+    return smoothed.astype(np.float32)
+
+# Dataset
+class HybridDenoisingDataset(Dataset):
+    def __init__(self, noisy_dir, clean_dir):
+        self.samples = []
+        self.noisy_dir = noisy_dir
+        self.clean_dir = clean_dir
+
+        for series_folder in sorted(os.listdir(noisy_dir)):
+            series_path = os.path.join(noisy_dir, series_folder)
+            if not os.path.isdir(series_path):
+                continue
+            for file_name in sorted(os.listdir(series_path)):
+                if file_name.endswith('.dcm'):
+                    self.samples.append((series_folder, file_name))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        series_folder, file_name = self.samples[idx]
+        noisy_path = os.path.join(self.noisy_dir, series_folder, file_name)
+        clean_path = os.path.join(self.clean_dir, series_folder, file_name)
+
+        noisy_dcm = pydicom.dcmread(noisy_path)
+        clean_dcm = pydicom.dcmread(clean_path)
+
+        noisy_img = noisy_dcm.pixel_array.astype(np.float32)
+        clean_img = clean_dcm.pixel_array.astype(np.float32)
+
+        preprocessed = traditional_pipeline(noisy_img)
+        input_tensor = torch.from_numpy(np.stack([noisy_img, preprocessed], axis=0))
+        input_tensor = (input_tensor + 1000) / 4000
+        input_tensor = torch.clamp(input_tensor, 0, 1)
+
+        target_tensor = (torch.from_numpy(clean_img).unsqueeze(0) + 1000) / 4000
+        target_tensor = torch.clamp(target_tensor, 0, 1)
+
+        return input_tensor.float(), target_tensor.float(), series_folder, file_name
+
+# Residual U-Net Model
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+class ResidualUNet(nn.Module):
+    def __init__(self, in_channels=2, out_channels=1):
+        super().__init__()
+        self.down1 = nn.Sequential(nn.Conv2d(in_channels, 32, 3, padding=1), nn.ReLU(), ResidualBlock(32))
+        self.pool1 = nn.MaxPool2d(2)
+        self.down2 = nn.Sequential(nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), ResidualBlock(64))
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.bottleneck = nn.Sequential(nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), ResidualBlock(128))
+
+        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.upconv2 = nn.Sequential(nn.Conv2d(128, 64, 3, padding=1), nn.ReLU(), ResidualBlock(64))
+
+        self.up1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.upconv1 = nn.Sequential(nn.Conv2d(64, 32, 3, padding=1), nn.ReLU(), ResidualBlock(32))
+
+        self.out_conv = nn.Conv2d(32, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        x1 = self.down1(x)
+        x2 = self.pool1(x1)
+        x3 = self.down2(x2)
+        x4 = self.pool2(x3)
+
+        x5 = self.bottleneck(x4)
+
+        x6 = self.up2(x5)
+        x6 = torch.cat([x6, x3], dim=1)
+        x7 = self.upconv2(x6)
+
+        x8 = self.up1(x7)
+        x8 = torch.cat([x8, x1], dim=1)
+        x9 = self.upconv1(x8)
+
+        out = self.out_conv(x9)
+        return out
+
+# Training
+model = ResidualUNet(in_channels=2).to(device)
+dataset = HybridDenoisingDataset(noisy_dir, clean_dir)
+train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+criterion = nn.MSELoss()
+optimizer = optim.AdamW(model.parameters(), lr=lr)
+
+for epoch in range(n_epochs):
+    model.train()
+    epoch_loss = 0.0
+    for inputs, targets, _, _ in train_loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        predicted_residual = model(inputs)
+        denoised = inputs[:, 0:1, :, :] - predicted_residual
+        loss = criterion(denoised, targets)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+    print(f"Epoch {epoch+1}/{n_epochs}, Loss: {epoch_loss / len(train_loader):.6f}")
+
+torch.save(model.state_dict(), model_save_path)
+print("Model saved to:", model_save_path)
+
+# Evaluation
+model.eval()
+total_psnr, total_ssim, total_mse = 0, 0, 0
+with torch.no_grad():
+    for inputs, targets, series, fname in DataLoader(dataset, batch_size=1):
+        inputs, targets = inputs.to(device), targets.to(device)
+        predicted_residual = model(inputs)
+        denoised = inputs[:, 0:1, :, :] - predicted_residual
+
+        pred_np = denoised.squeeze().cpu().numpy()
+        target_np = targets.squeeze().cpu().numpy()
+
+        p = psnr(target_np, pred_np, data_range=1.0)
+        s = ssim(target_np, pred_np, data_range=1.0)
+        m = np.mean((target_np - pred_np) ** 2)
+
+        total_psnr += p
+        total_ssim += s
+        total_mse += m
+
+        print(f"{series[0]}/{fname[0]} - PSNR: {p:.2f}, SSIM: {s:.4f}, MSE: {m:.6f}")
+
+n = len(dataset)
+print(f"\nAverage PSNR: {total_psnr / n:.4f} dB")
+print(f"Average SSIM: {total_ssim / n:.4f}")
+print(f"Average MSE: {total_mse / n:.6f}")
